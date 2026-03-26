@@ -14,4 +14,13 @@ WSL 기반 Python 프로젝트.
 
 ## Main entrypoint
 ```bash
+
+## to do list:
+ - get better data, store them in db (influx)
+ - 연산 최적화
+ - IBKR 연동
+ - position에 대한 고민 (portfolio rebalancing algorithm)
+ - factors 개수 확장 
+ - f prediction
+ 
 python3 scripts/run_factor_pipeline.py
