@@ -1,190 +1,204 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 
-def build_business_dates(start: str, end: str) -> pd.DatetimeIndex:
+def build_business_dates(start: str | pd.Timestamp, end: str | pd.Timestamp) -> pd.DatetimeIndex:
     """
-    Build business-day dates for the analysis horizon.
+    Business-day date index used as the master time axis.
     """
-    return pd.bdate_range(start=start, end=end)
+    start_ts = pd.Timestamp(start).normalize()
+    end_ts = pd.Timestamp(end).normalize()
+    if end_ts < start_ts:
+        raise ValueError("end must be >= start")
+    return pd.date_range(start_ts, end_ts, freq="B")
 
 
-def normalize_ticker_for_yf(ticker: str) -> str:
+def filter_nasdaq_common_stocks(
+    tickers_df: pd.DataFrame,
+    exchange_col: str = "primary_exchange",
+    ticker_col: str = "ticker",
+    type_col: str = "type",
+) -> pd.DataFrame:
     """
-    Convert internal ticker format to Yahoo Finance ticker format.
-    Example:
-      BRK.B -> BRK-B
+    Keep only NASDAQ-listed common stocks from Massive ticker metadata.
+
+    Expected Massive-like columns:
+      - ticker
+      - primary_exchange
+      - type
+      - list_date (optional)
+      - delisted_utc (optional)
+
+    Common stock type is usually 'CS'.
+    NASDAQ primary exchange is usually 'XNAS'.
     """
-    return str(ticker).strip().replace(".", "-")
+    required = [ticker_col, exchange_col, type_col]
+    missing = [c for c in required if c not in tickers_df.columns]
+    if missing:
+        raise ValueError(f"tickers_df missing required columns: {missing}")
 
+    df = tickers_df.copy()
 
-def _read_annotated_csv(annotated_csv: str) -> pd.DataFrame:
-    """
-    Read annotated_sp500.csv robustly.
+    df[ticker_col] = df[ticker_col].astype(str).str.strip().str.upper()
+    df[exchange_col] = df[exchange_col].astype(str).str.strip().str.upper()
+    df[type_col] = df[type_col].astype(str).str.strip().str.upper()
 
-    Supports:
-    1) Plain CSV with header:
-         ticker,effective_dt,in_index
-         ticker,effective_date,in_index
-    2) Headerless 3-column CSV
-    3) Influx annotated CSV export with leading # rows
-    """
-    # Influx annotated CSV: skip lines starting with '#'
-    df = pd.read_csv(annotated_csv, comment="#")
+    df = df[(df[exchange_col] == "XNAS") & (df[type_col] == "CS")].copy()
 
-    # Normalize column names
-    rename_map = {}
-    for c in df.columns:
-        cl = str(c).strip().lower()
+    # Optional date normalization
+    if "list_date" in df.columns:
+        df["list_date"] = pd.to_datetime(df["list_date"], errors="coerce").dt.normalize()
 
-        if cl in {"ticker", "symbol", "tic"}:
-            rename_map[c] = "ticker"
+    if "delisted_utc" in df.columns:
+        df["delisted_utc"] = pd.to_datetime(df["delisted_utc"], errors="coerce").dt.normalize()
 
-        elif cl in {
-            "effective_date",
-            "effective_dt",
-            "date",
-            "time",
-            "asof",
-            "_time",
-        }:
-            rename_map[c] = "effective_date"
+    # Drop duplicate tickers deterministically:
+    # prefer rows with earlier list_date and later/no delisted date.
+    sort_cols = []
+    ascending = []
 
-        elif cl in {
-            "in_index",
-            "active",
-            "member",
-            "is_member",
-            "value",
-            "state",
-            "_value",
-        }:
-            rename_map[c] = "in_index"
+    if "list_date" in df.columns:
+        sort_cols.append("list_date")
+        ascending.append(True)
 
-    df = df.rename(columns=rename_map)
+    if "delisted_utc" in df.columns:
+        # NaT last by default with na_position='last'
+        sort_cols.append("delisted_utc")
+        ascending.append(False)
 
-    required = {"ticker", "effective_date", "in_index"}
-    if required.issubset(df.columns):
-        return df[["ticker", "effective_date", "in_index"]].copy()
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=ascending, na_position="last")
 
-    # Fallback: headerless 3-column
-    df2 = pd.read_csv(
-        annotated_csv,
-        comment="#",
-        header=None,
-        names=["ticker", "effective_date", "in_index"],
-    )
-    return df2
-
-
-def load_annotated_events(annotated_csv: str) -> pd.DataFrame:
-    """
-    Load and clean event-style S&P500 membership annotations.
-
-    Returns a DataFrame with columns:
-      ticker: str
-      effective_date: Timestamp (UTC-naive after normalization)
-      in_index: int (0 or 1)
-    """
-    df = _read_annotated_csv(annotated_csv).copy()
-
-    df["ticker"] = df["ticker"].astype(str).str.strip()
-    df["effective_date"] = pd.to_datetime(df["effective_date"], format="%Y-%m-%dT%H:%M:%S%z", utc=True, errors="coerce")
-    df["in_index"] = pd.to_numeric(df["in_index"], errors="coerce")
-
-    df = df.dropna(subset=["ticker", "effective_date", "in_index"]).copy()
-    df["in_index"] = df["in_index"].astype(int)
-
-    # Normalize to naive timestamps after UTC conversion, so comparisons are consistent
-    df["effective_date"] = df["effective_date"].dt.tz_convert("UTC").dt.tz_localize(None)
-
-    # Keep only 0/1 rows
-    df = df[df["in_index"].isin([0, 1])].copy()
-
-    # Sort for forward-fill style state propagation
-    df = df.sort_values(["ticker", "effective_date"]).reset_index(drop=True)
-
+    df = df.drop_duplicates(subset=[ticker_col], keep="first").reset_index(drop=True)
     return df
 
 
-def build_master_tickers(events: pd.DataFrame) -> List[str]:
+def build_nasdaq_universe_mask(
+    tickers_df: pd.DataFrame,
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+    ticker_col: str = "ticker",
+    list_date_col: str = "list_date",
+    delisted_col: str = "delisted_utc",
+) -> tuple[list[str], pd.DatetimeIndex, np.ndarray]:
     """
-    Sorted unique ticker list appearing in the event file.
+    Build a date-by-ticker boolean universe mask from listing / delisting info.
+
+    Rules:
+    - if list_date is missing, assume active from global start
+    - if delisted_utc is missing, assume active until global end
+    - active interval is inclusive on both ends
     """
-    return sorted(events["ticker"].dropna().astype(str).unique().tolist())
+    if ticker_col not in tickers_df.columns:
+        raise ValueError(f"tickers_df missing required column: {ticker_col}")
 
+    df = tickers_df.copy()
+    df[ticker_col] = df[ticker_col].astype(str).str.strip().str.upper()
 
-def build_universe_mask_from_annotated(
-    annotated_csv: str,
-    start: str,
-    end: str,
-) -> Tuple[pd.DatetimeIndex, List[str], np.ndarray]:
-    """
-    Build universe mask [T, N] from event-style annotated CSV.
+    start_ts = pd.Timestamp(start).normalize()
+    end_ts = pd.Timestamp(end).normalize()
+    dates = build_business_dates(start_ts, end_ts)
 
-    Logic:
-    - For each ticker, events define changes of membership state over time.
-    - At each date t, ticker is in universe iff the latest event on or before t has in_index == 1.
+    tickers = sorted(df[ticker_col].dropna().unique().tolist())
+    ticker_to_j = {t: j for j, t in enumerate(tickers)}
 
-    Returns:
-      dates: DatetimeIndex [T]
-      tickers: list[str] [N]
-      universe_mask: bool ndarray [T, N]
-    """
-    events = load_annotated_events(annotated_csv)
-    dates = build_business_dates(start, end)
-
-    # Convert dates to naive timestamps for consistent comparison
-    date_values = pd.DatetimeIndex(dates).tz_localize(None)
-    tickers = build_master_tickers(events)
-
-    T = len(date_values)
+    T = len(dates)
     N = len(tickers)
-    mask = np.zeros((T, N), dtype=bool)
+    universe_mask = np.zeros((T, N), dtype=bool)
 
-    for j, ticker in enumerate(tickers):
-        sub = events.loc[events["ticker"] == ticker, ["effective_date", "in_index"]].copy()
-        if sub.empty:
+    if list_date_col in df.columns:
+        df[list_date_col] = pd.to_datetime(df[list_date_col], errors="coerce").dt.normalize()
+    else:
+        df[list_date_col] = pd.NaT
+
+    if delisted_col in df.columns:
+        df[delisted_col] = pd.to_datetime(df[delisted_col], errors="coerce").dt.normalize()
+    else:
+        df[delisted_col] = pd.NaT
+
+    for _, row in df.iterrows():
+        ticker = row[ticker_col]
+        j = ticker_to_j[ticker]
+
+        list_dt = row[list_date_col]
+        delist_dt = row[delisted_col]
+
+        if pd.isna(list_dt):
+            list_dt = start_ts
+        if pd.isna(delist_dt):
+            delist_dt = end_ts
+
+        # clip to requested window
+        active_start = max(list_dt, start_ts)
+        active_end = min(delist_dt, end_ts)
+
+        if active_end < active_start:
             continue
 
-        sub = sub.sort_values("effective_date")
-        ev_dates = sub["effective_date"].to_numpy(dtype="datetime64[ns]")
-        ev_vals = sub["in_index"].to_numpy(dtype=np.int8)
+        active = (dates >= active_start) & (dates <= active_end)
+        universe_mask[active, j] = True
 
-        # For each analysis date, find last event index <= date
-        idx = np.searchsorted(ev_dates, date_values.to_numpy(dtype="datetime64[ns]"), side="right") - 1
+    return tickers, dates, universe_mask
 
-        valid = idx >= 0
-        state = np.zeros(T, dtype=bool)
-        state[valid] = ev_vals[idx[valid]] == 1
-        mask[:, j] = state
 
-    return dates, tickers, mask
+def refine_universe_mask_with_panel_data(
+    universe_mask: np.ndarray,
+    panel: dict,
+    price_field: str = "adj_close",
+) -> np.ndarray:
+    """
+    Refine the metadata-based universe mask using actual price availability.
+
+    Keeps a name in the universe only where panel[price_field] is finite.
+    This is important because listing metadata and price coverage often do not
+    align perfectly.
+
+    Expected:
+      panel[price_field] shape == (T, N)
+    """
+    if price_field not in panel:
+        raise KeyError(f"panel missing field: {price_field}")
+
+    px = np.asarray(panel[price_field])
+    if px.ndim != 2:
+        raise ValueError(f"panel[{price_field!r}] must be 2D, got shape={px.shape}")
+
+    mask = np.asarray(universe_mask, dtype=bool)
+    if mask.shape != px.shape:
+        raise ValueError(
+            f"shape mismatch: universe_mask {mask.shape} vs panel[{price_field!r}] {px.shape}"
+        )
+
+    has_price = np.isfinite(px)
+    refined = mask & has_price
+    return refined
 
 
 def summarize_universe_mask(
-    dates: pd.DatetimeIndex,
-    tickers: List[str],
     universe_mask: np.ndarray,
+    dates: Iterable[pd.Timestamp] | pd.DatetimeIndex,
 ) -> pd.DataFrame:
     """
-    Quick diagnostics:
-      date, number of names in universe
+    Simple diagnostics: number of active names per date.
     """
-    return pd.DataFrame(
-        {
-            "date": dates,
-            "n_names": universe_mask.sum(axis=1),
-        }
-    )
+    mask = np.asarray(universe_mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError("universe_mask must be 2D")
 
+    dates_idx = pd.DatetimeIndex(dates)
+    if len(dates_idx) != mask.shape[0]:
+        raise ValueError(
+            f"dates length {len(dates_idx)} does not match mask rows {mask.shape[0]}"
+        )
 
-def build_yf_tickers_from_master(master_tickers: List[str]) -> List[str]:
-    """
-    Convert internal tickers to yfinance-compatible tickers.
-    """
-    return [normalize_ticker_for_yf(t) for t in master_tickers]
+    active_count = mask.sum(axis=1).astype(int)
+
+    out = pd.DataFrame({
+        "date": dates_idx,
+        "n_active": active_count,
+    })
+    return out
