@@ -12,10 +12,10 @@ from factors.io import (
 
 from factors.universe_mask import (
     filter_nasdaq_common_stocks,
-    build_nasdaq_universe_mask,
+    build_nasdaq_universe_mask_from_dates,
     refine_universe_mask_with_panel_data,
 )
-from factors.raw_factors import compute_raw_factors
+from factors.raw_factors import compute_raw_factors, compute_returns
 
 from factors.build_x import build_X
 from factors.estimate_f import estimate_factor_returns
@@ -51,17 +51,7 @@ tickers_df = download_massive_tickers(
     active=None,  # active + delisted 둘 다
 )
 
-print("Building NASDAQ universe mask...")
-
 tickers_df = filter_nasdaq_common_stocks(tickers_df)
-
-tickers, dates, universe_mask = build_nasdaq_universe_mask(
-    tickers_df,
-    start=START,
-    end=END,
-)
-
-print(f"Universe size: {len(tickers)}")
 
 
 # ==============================
@@ -70,11 +60,31 @@ print(f"Universe size: {len(tickers)}")
 
 print("Downloading grouped daily bars...")
 
-bars_long = download_massive_grouped_daily_range(dates)
+request_dates = pd.date_range(START, END, freq="B")
+bars_long = download_massive_grouped_daily_range(request_dates)
+
+bars_long["date"] = pd.to_datetime(bars_long["date"], errors="coerce").dt.normalize()
+dates = pd.DatetimeIndex(sorted(bars_long["date"].dropna().unique()))
+
+print(f"Trading dates: {len(dates)}")
 
 
 # ==============================
-# 3. LONG → PANEL
+# 3. BUILD UNIVERSE MASK ON TRADING DATES
+# ==============================
+
+print("Building NASDAQ universe mask...")
+
+tickers, dates, universe_mask = build_nasdaq_universe_mask_from_dates(
+    tickers_df,
+    dates=dates,
+)
+
+print(f"Universe size: {len(tickers)}")
+
+
+# ==============================
+# 4. LONG → PANEL
 # ==============================
 
 print("Building panel...")
@@ -126,12 +136,12 @@ X, valid_mask, factor_names = build_X(
 
 print("Building forward returns...")
 
-adj_close = panel["adj_close"]
-
-r = np.full_like(adj_close, np.nan)
 
 horizon = 1
-r[:-horizon] = adj_close[horizon:] / adj_close[:-horizon] - 1
+backward_r = compute_returns(panel["adj_close"], lag=horizon)
+
+r = np.full_like(backward_r, np.nan)
+r[:-horizon] = backward_r[horizon:]
 
 
 # ==============================
